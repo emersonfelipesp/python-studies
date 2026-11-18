@@ -1,0 +1,75 @@
+name: Public study example checks
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-study-checks-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  verify:
+    name: Public examples / Python ${{ matrix.python-version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    env:
+      STUDY_EXPECTED_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up the independent Python row
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Record original example and SQLite bytes
+        run: |
+          mkdir -p ci-evidence
+          sha256sum sqlmodel-app/*.py sqlmodel-app/*.db > ci-evidence/source-before.txt
+          python --version > ci-evidence/python-version.txt
+      - name: Install pinned CI-only dependencies
+        run: |
+          timeout --kill-after=10s 300s python -m pip install -r requirements-ci.txt
+          python -m pip check
+          python -m pip freeze > ci-evidence/installed.txt
+      - name: Compile both original tutorial modules and public tests
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/study-pyc-${{ matrix.python-version }}
+        run: python -m compileall -q sqlmodel-app tests
+      - name: Run all public example tests without external telemetry
+        run: |
+          timeout --kill-after=10s 300s env -i PATH="$PATH" LANG=C.UTF-8 PYTHONDONTWRITEBYTECODE=1 OTEL_SDK_DISABLED=true STUDY_EXPECTED_PYTHON="$STUDY_EXPECTED_PYTHON" python -m pytest tests/ -v --junitxml=ci-evidence/junit.xml
+      - name: Verify original example and SQLite bytes
+        if: always()
+        run: |
+          sha256sum sqlmodel-app/*.py sqlmodel-app/*.db > ci-evidence/source-after.txt
+          cmp ci-evidence/source-before.txt ci-evidence/source-after.txt
+      - name: Retain only bounded quality evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: public-study-${{ matrix.python-version }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ci-evidence/
+          if-no-files-found: error
+
+  complete:
+    name: Public study checks complete
+    if: always()
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require both independent Python rows
+        env:
+          MATRIX_RESULT: ${{ needs.verify.result }}
+        run: test "$MATRIX_RESULT" = success
